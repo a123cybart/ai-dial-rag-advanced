@@ -22,14 +22,14 @@ class TextProcessor:
     def _get_connection(self):
         """Get database connection"""
         return psycopg2.connect(
-            host=self.db_config['host'],
-            port=self.db_config['port'],
-            database=self.db_config['database'],
-            user=self.db_config['user'],
-            password=self.db_config['password']
+            host=self.db_config["host"],
+            port=self.db_config["port"],
+            database=self.db_config["database"],
+            user=self.db_config["user"],
+            password=self.db_config["password"],
         )
 
-    #TODO:
+    # TODO:
     # provide method `process_text_file` that will:
     #   - apply file name, chunk size, overlap, dimensions and bool of the table should be truncated
     #   - truncate table with vectors if needed
@@ -38,11 +38,40 @@ class TextProcessor:
     #   - save (insert) embeddings and chunks to DB
     #       hint 1: embeddings should be saved as string list
     #       hint 2: embeddings string list should be casted to vector ({embeddings}::vector)
+    def process_text_file(
+        self,
+        file_name: str,
+        chunk_size: int,
+        overlap: int,
+        dimensions: int,
+        truncate_table: bool = False,
+    ):
+        with self._get_connection() as conn:
+            with conn.cursor() as cursor:
+                if truncate_table:
+                    cursor.execute("TRUNCATE TABLE vectors;")
+                    conn.commit()
 
+                with open(file_name, "r", encoding="utf-8") as file:
+                    content = file.read()
 
+                chunks = chunk_text(content, chunk_size, overlap)
+                embeddings_dict = self.embeddings_client.get_embeddings(
+                    input_texts=chunks, dimensions=dimensions
+                )
+                print(
+                    f"Generated {len(embeddings_dict)} embeddings for {len(chunks)} chunks."
+                )
+                for index, chunk in enumerate(chunks):
+                    embedding_vector = embeddings_dict.get(index)
+                    if embedding_vector:
+                        cursor.execute(
+                            "INSERT INTO vectors (text, embedding) VALUES (%s, %s::vector);",
+                            (chunk, embedding_vector),
+                        )
+                conn.commit()
 
-
-    #TODO:
+    # TODO:
     # provide method `search` that will:
     #   - apply search mode, user request, top k for search, min score threshold and dimensions
     #   - generate embeddings from user request
@@ -52,4 +81,41 @@ class TextProcessor:
     #     hint 3: You need to extract `text` from `vectors` table
     #     hint 4: You need to filter distance in WHERE clause
     #     hint 5: To get top k use `limit`
+    def search(
+        self,
+        search_mode: SearchMode,
+        user_request: str,
+        top_k: int,
+        min_score_threshold: float,
+        dimensions: int,
+    ) -> str:
+        embedding_dict = self.embeddings_client.get_embeddings(
+            input_texts=[user_request], dimensions=dimensions
+        )
+        user_embedding = embedding_dict.get(0)
 
+        if not user_embedding:
+            return ""
+
+        distance_operator = (
+            "<=>" if search_mode == SearchMode.COSINE_DISTANCE else "<->"
+        )
+
+        query = f"""
+            SELECT text, embedding {distance_operator} %s::vector AS distance
+            FROM vectors
+            WHERE embedding {distance_operator} %s::vector < %s
+            ORDER BY distance
+            LIMIT %s;
+        """
+
+        with self._get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute(
+                    query,
+                    (user_embedding, user_embedding, min_score_threshold, top_k),
+                )
+                results = cursor.fetchall()
+
+        context_texts = [result["text"] for result in results]
+        return "\n---\n".join(context_texts)
